@@ -1,6 +1,6 @@
 import unittest
 
-from auto_subtitle import Word, format_timestamp, split_into_cues, to_srt
+from auto_subtitle import START_MARKER, Cue, Word, add_start_marker, format_timestamp, split_into_cues, to_srt
 
 
 class SplitTest(unittest.TestCase):
@@ -66,6 +66,15 @@ class SplitTest(unittest.TestCase):
         self.assertEqual(format_timestamp(3661.5), "01:01:01,500")
         words = [Word(1.0, 2.0, "テスト")]
         self.assertEqual(to_srt(split_into_cues(words)), "1\n00:00:01,000 --> 00:00:02,000\nテスト\n")
+
+    def test_start_marker(self):
+        cues = add_start_marker([Cue(25.65, 28.0, "マルチビタミン")])
+        self.assertEqual((cues[0].start, cues[0].end, cues[0].text), (0.0, 1.0, START_MARKER))
+        # 話し始めが 1 秒より早いときは、目印が字幕に重ならない
+        cues = add_start_marker([Cue(0.4, 1.0, "はい")])
+        self.assertEqual(cues[0].end, 0.4)
+        # 0 秒ちょうどから話しているときは目印不要
+        self.assertEqual(len(add_start_marker([Cue(0.0, 1.0, "はい")])), 1)
 
 
 if __name__ == "__main__":

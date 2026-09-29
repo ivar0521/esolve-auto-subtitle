@@ -17,6 +17,11 @@ from pathlib import Path
 SENTENCE_END = tuple("。！？!?")
 # 字幕の末尾から取り除く文字 (日本語字幕では句点を付けないのが一般的)
 TRAILING_STRIP = "。、,."
+# 動画の 0 秒目に置く目印の字幕。Resolve は最初の字幕を置いた位置を起点にするため、
+# これが無いと話し始めまでの無音が詰められて字幕がずれる
+START_MARKER = "▼"
+# 聞き取ってほしい単語を書いておくファイル (ツールと同じフォルダ)
+WORD_LIST = Path(__file__).with_name("単語リスト.txt")
 
 
 @dataclass
@@ -178,10 +183,31 @@ def to_srt(cues: list[Cue]) -> str:
     return "\n".join(blocks)
 
 
+def add_start_marker(cues: list[Cue]) -> list[Cue]:
+    """動画の 0 秒目に目印の字幕を足す (次の字幕とは重ねない)。"""
+    if not cues or cues[0].start < 0.05:
+        return cues
+    return [Cue(0.0, min(1.0, cues[0].start), START_MARKER)] + cues
+
+
+def load_hotwords() -> str | None:
+    """単語リスト.txt に書かれた単語 (改行・読点区切り) を、聞き取りのヒントにする。"""
+    if not WORD_LIST.is_file():
+        return None
+    text = WORD_LIST.read_text(encoding="utf-8")
+    words = [w.strip() for w in text.replace("、", "\n").replace(",", "\n").splitlines()]
+    words = [w for w in words if w and not w.startswith("#")]
+    return "、".join(words) or None
+
+
 def transcribe(path: Path, model, language: str | None, use_vad: bool = True) -> list[Word]:
+    hotwords = load_hotwords()
+    if hotwords:
+        print(f"  単語リスト: {hotwords}")
     segments, info = model.transcribe(
         str(path),
         language=language,
+        hotwords=hotwords,
         word_timestamps=True,
         # 無音部分を飛ばし、無音中の誤認識を防ぐ。ぼそっと話す声や BGM に重なった声を
         # 落とさないよう、声とみなす基準 (既定 0.5) を大きく下げ、前後の余白も広げている
@@ -216,6 +242,7 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="無音の自動スキップを止める (声が抜けるとき用。BGM だけの部分で誤字幕が出やすくなる)",
     )
+    parser.add_argument("--no-marker", action="store_true", help="0 秒目の目印「▼」を付けない")
     args = parser.parse_args(argv)
 
     missing = [f for f in args.files if not f.is_file()]
@@ -238,9 +265,14 @@ def main(argv: list[str] | None = None) -> int:
             max_chars=args.max_chars,
             strip_punctuation=not args.keep_punctuation,
         )
+        count = len(cues)
+        if not args.no_marker:
+            cues = add_start_marker(cues)
         out = path.with_suffix(".srt")
         out.write_text(to_srt(cues), encoding="utf-8")
-        print(f"✅ 字幕 {len(cues)} 件を保存しました: {out}")
+        print(f"✅ 字幕 {count} 件を保存しました: {out}")
+        if cues and cues[0].text == START_MARKER:
+            print("   Resolve では、最初の「▼」をクリップの先頭に合わせてから「▼」を削除してください")
     return 0
 
 
