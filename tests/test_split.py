@@ -105,6 +105,21 @@ class SplitTest(unittest.TestCase):
         self.assertEqual([c.text for c in split_into_cues(words)],
                          ["米がうまい", "米がうまいと満足度が高い"])
 
+    def test_last_char_of_word_is_not_moved(self):
+        # 「生姜とニンニ」「クちょっと」になっていたケース
+        words = [Word(0.0, 0.5, "生姜と"), Word(0.5, 1.0, "ニンニ"), Word(1.0, 1.2, "ク", segment_end=True),
+                 Word(5.0, 5.5, "ちょっと", segment_end=True)]
+        self.assertEqual([c.text for c in split_into_cues(clean_words(words))], ["生姜とニンニク", "ちょっと"])
+
+    def test_pause_inside_word_does_not_split(self):
+        # 「寝てただけだから全然お」「腹空いてないけど」になっていたケース
+        words = [Word(0.0, 1.0, "全然お"), Word(1.5, 2.0, "腹"), Word(2.0, 2.5, "空いてない")]
+        self.assertEqual([c.text for c in split_into_cues(words)], ["全然お腹空いてない"])
+
+    def test_unsure_is_carried_to_cue(self):
+        words = [Word(0.0, 1.0, "いただきます", segment_end=True, unsure=True)]
+        self.assertTrue(split_into_cues(words)[0].unsure)
+
 
 if __name__ == "__main__":
     unittest.main()

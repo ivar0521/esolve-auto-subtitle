@@ -32,6 +32,7 @@ class Word:
     end: float
     text: str
     segment_end: bool = False  # Whisper が区切った発話のまとまりの最後の単語
+    unsure: bool = False  # 聞き取りに自信がない (取りこぼし拾い直しで拾った声など)
 
 
 @dataclass
@@ -40,6 +41,7 @@ class Cue:
     end: float
     text: str
     cut: bool = False  # 長すぎて途中で切った字幕 (続きが次の字幕にある)
+    unsure: bool = False
 
 
 def char_type(c: str) -> str:
@@ -73,6 +75,8 @@ def boundary_score(left: str, right: str) -> int:
     a, b = char_type(left[-1]), char_type(right.lstrip()[0])
     if a in ("end", "comma"):
         return 4
+    if a == "hira" and b == "kanji" and left[-1] in "おご":  # 「お|腹」「ご|飯」
+        return 0
     if a == "hira" and b in ("kanji", "kata", "alnum"):  # 「と|イチゴ」助詞の後
         # 「イチゴの|プロテイン」の「の」はつながりが強いので少し下げる
         return 2 if left.endswith("の") else 3
@@ -110,7 +114,7 @@ def split_into_cues(
         if strip_punctuation:
             text = text.rstrip(TRAILING_STRIP).strip()
         if text:
-            cues.append(Cue(ws[0].start, ws[-1].end, text, cut))
+            cues.append(Cue(ws[0].start, ws[-1].end, text, cut, any(w.unsure for w in ws)))
 
     def flush() -> None:
         if current:
@@ -130,8 +134,13 @@ def split_into_cues(
     for word in words:
         if not word.text.strip():
             continue
-        if current and word.start - current[-1].end > max_gap:
-            flush()
+        if current:
+            # 間があれば字幕を切り替える。ただし「全然お|腹」のような単語の途中は、
+            # 1 秒以上空いていない限り切らない
+            gap = word.start - current[-1].end
+            natural = boundary_score(text_of(current), word.text) >= 1
+            if (gap > max_gap and natural) or gap > 1.0:
+                flush()
         while current and (
             len(text_of(current + [word])) > max_chars
             or word.end - current[0].start > max_duration
@@ -157,6 +166,7 @@ def split_into_cues(
             prev.text += sep + cue.text
             prev.end = cue.end
             prev.cut = cue.cut
+            prev.unsure = prev.unsure or cue.unsure
         else:
             merged.append(cue)
     cues = merged
@@ -198,7 +208,9 @@ def clean_words(words: list[Word]) -> list[Word]:
 
     - 単独の「１」「（」などのゴミ文字を消す
     - 発話のまとまりの最後に、次の単語の頭 1 文字だけが紛れ込む
-      (例:「マルチビタミン オ|ートミール」) ので、次のまとまりへ移す
+      (例:「マルチビタミン オ|ートミール」) ので、次のまとまりへ移す。
+      Whisper は単語の頭に空白を付けるので、空白で始まる 1 文字だけを対象にする
+      (「ニンニ|ク」のような単語の最後の文字は動かさない)
     """
     cleaned: list[Word] = []
     for i, w in enumerate(words):
@@ -214,6 +226,7 @@ def clean_words(words: list[Word]) -> list[Word]:
         w, nxt = cleaned[i], cleaned[i + 1]
         if (
             w.segment_end
+            and w.text[:1].isspace()
             and len(w.text.strip()) == 1
             and i > 0
             and boundary_score(w.text, nxt.text) == 0
@@ -225,9 +238,63 @@ def clean_words(words: list[Word]) -> list[Word]:
     return cleaned
 
 
+SAMPLE_RATE = 16000
+# 無音や雑音から Whisper が作りがちな、実際には言っていない文
+HALLUCINATIONS = {"ご視聴ありがとうございました", "チャンネル登録よろしくお願いします", "おやすみなさい"}
+
+
+def whisper_words(segments, offset: float = 0.0, unsure: bool = False, show: bool = True) -> list[Word]:
+    words: list[Word] = []
+    for seg in segments:
+        if show:
+            print(f"  [{format_timestamp(seg.start + offset)}] {seg.text.strip()}")
+        seg_words = [Word(w.start + offset, w.end + offset, w.word, unsure=unsure) for w in seg.words or []]
+        if seg_words:
+            seg_words[-1].segment_end = True
+        words.extend(seg_words)
+    return words
+
+
+def recover_missed_speech(audio, model, language: str | None, words: list[Word]) -> list[Word]:
+    """1 回目で字幕にならなかった小さな声 (「いただきます」など) を拾い直す。
+
+    声らしい区間をもっと甘い基準で探し、まだ字幕がない区間だけを個別に文字起こしする。
+    拾った声は「自信なし」として印を付け、AI 校正で採用するか判断させる。
+    """
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    regions = get_speech_timestamps(
+        audio,
+        VadOptions(threshold=0.1, min_speech_duration_ms=200, min_silence_duration_ms=300, speech_pad_ms=300),
+    )
+    recovered: list[Word] = []
+    for r in regions:
+        start, end = r["start"] / SAMPLE_RATE, r["end"] / SAMPLE_RATE
+        if end - start < 0.3 or any(w.end > start and w.start < end for w in words):
+            continue
+        segments, _ = model.transcribe(
+            audio[r["start"] : r["end"]],
+            language=language,
+            word_timestamps=True,
+            vad_filter=False,
+            condition_on_previous_text=False,
+            no_speech_threshold=0.9,
+        )
+        for seg in segments:
+            text = seg.text.strip().rstrip("。")
+            if not text or text in HALLUCINATIONS or seg.avg_logprob < -1.5:
+                continue
+            print(f"  [{format_timestamp(seg.start + start)}] (拾い直し) {text}")
+            recovered += whisper_words([seg], offset=start, unsure=True, show=False)
+    return sorted(words + recovered, key=lambda w: w.start)
+
+
 def transcribe(path: Path, model, language: str | None, use_vad: bool = True) -> list[Word]:
+    from faster_whisper.audio import decode_audio
+
+    audio = decode_audio(str(path), sampling_rate=SAMPLE_RATE)
     segments, info = model.transcribe(
-        str(path),
+        audio,
         language=language,
         word_timestamps=True,
         # 無音部分を飛ばし、無音中の誤認識を防ぐ。ぼそっと話す声や BGM に重なった声を
@@ -240,13 +307,9 @@ def transcribe(path: Path, model, language: str | None, use_vad: bool = True) ->
         no_speech_threshold=0.9,
     )
     print(f"  言語: {info.language}  長さ: {info.duration:.0f}秒")
-    words: list[Word] = []
-    for seg in segments:
-        print(f"  [{format_timestamp(seg.start)}] {seg.text.strip()}")
-        seg_words = [Word(w.start, w.end, w.word) for w in seg.words or []]
-        if seg_words:
-            seg_words[-1].segment_end = True
-        words.extend(seg_words)
+    words = whisper_words(segments)
+    if use_vad:
+        words = recover_missed_speech(audio, model, language, words)
     return clean_words(words)
 
 
@@ -267,6 +330,8 @@ def main(argv: list[str] | None = None) -> int:
         help="無音の自動スキップを止める (声が抜けるとき用。BGM だけの部分で誤字幕が出やすくなる)",
     )
     parser.add_argument("--no-marker", action="store_true", help="0 秒目の目印「▼」を付けない")
+    parser.add_argument("--no-ai", action="store_true", help="AI (Claude) による字幕の校正をしない")
+    parser.add_argument("--about", default="", help="動画の内容 (AI 校正のヒント。例: 朝ごはんのダイエット vlog)")
     args = parser.parse_args(argv)
 
     missing = [f for f in args.files if not f.is_file()]
@@ -289,6 +354,13 @@ def main(argv: list[str] | None = None) -> int:
             max_chars=args.max_chars,
             strip_punctuation=not args.keep_punctuation,
         )
+        if not args.no_ai:
+            from ai_fix import ai_fix, load_api_key
+
+            if load_api_key():
+                cues = ai_fix(cues, args.about)
+            else:
+                print("  (APIキー.txt がないので AI 校正はスキップしました)")
         count = len(cues)
         if not args.no_marker:
             cues = add_start_marker(cues)
