@@ -20,6 +20,13 @@ read -r -p "> " choice
 model="large-v3-turbo"
 [ "$choice" = "2" ] && model="small"
 
-./.venv/bin/python auto_subtitle.py --model "$model" "$@"
+echo ""
+echo "それでも声が抜ける場合だけ 3 を選んでください: 3=全部の音を文字起こしする (BGM だけの所に変な字幕が出ることがあります)"
+echo "(普段はそのまま Enter)"
+read -r -p "> " vad
+extra=()
+[ "$vad" = "3" ] && extra=(--no-vad)
+
+./.venv/bin/python auto_subtitle.py --model "$model" "${extra[@]}" "$@"
 echo ""
 read -r -p "終わりました。Enter キーで閉じます"
