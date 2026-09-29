@@ -32,13 +32,6 @@ main() {
   extra=()
   [ "$vad" = "3" ] && extra=(--no-vad)
 
-  if [ ! -s "APIキー.txt" ]; then
-    echo ""
-    echo "AI で字幕を自然に直す場合は、Anthropic の API キーを貼り付けて Enter してください。"
-    echo "(使わない場合はそのまま Enter)"
-    read -r -p "> " key
-    [ -n "$key" ] && printf '%s\n' "$key" > "APIキー.txt"
-  fi
   if [ -s "APIキー.txt" ]; then
     echo ""
     echo "動画の内容を一言で入力してください (AI のヒントになります。例: 朝ごはんと夜ごはんのダイエット vlog)"
