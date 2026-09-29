@@ -1,6 +1,15 @@
 import unittest
 
-from auto_subtitle import START_MARKER, Cue, Word, add_start_marker, format_timestamp, split_into_cues, to_srt
+from auto_subtitle import (
+    START_MARKER,
+    Cue,
+    Word,
+    add_start_marker,
+    clean_words,
+    format_timestamp,
+    split_into_cues,
+    to_srt,
+)
 
 
 class SplitTest(unittest.TestCase):
@@ -75,6 +84,26 @@ class SplitTest(unittest.TestCase):
         self.assertEqual(cues[0].end, 0.4)
         # 0 秒ちょうどから話しているときは目印不要
         self.assertEqual(len(add_start_marker([Cue(0.0, 1.0, "はい")])), 1)
+
+    def test_noise_tokens_removed(self):
+        words = [Word(0.0, 0.5, "甘い"), Word(0.5, 0.6, "１", segment_end=True),
+                 Word(1.0, 1.5, "卵"), Word(1.5, 1.6, "１"), Word(1.6, 1.8, "個"), Word(1.8, 1.9, "（")]
+        self.assertEqual("".join(w.text for w in clean_words(words)), "甘い卵１個")
+        self.assertTrue(clean_words(words)[0].segment_end)
+
+    def test_stray_first_char_moves_to_next_cue(self):
+        # 実際の字幕で「マルチビタミック オ」「ートミール…」になっていたケース
+        words = [Word(13.8, 15.0, "マルチ"), Word(15.0, 16.0, "ビタミン"), Word(16.0, 16.6, " オ", segment_end=True),
+                 Word(26.0, 26.5, "ート"), Word(26.5, 27.0, "ミール", segment_end=True)]
+        cues = split_into_cues(clean_words(words))
+        self.assertEqual([c.text for c in cues], ["マルチビタミン", "オートミール"])
+        self.assertAlmostEqual(cues[1].start, 26.0)
+
+    def test_short_pause_splits_cue(self):
+        # 「米がうまい」で一度切る
+        words = [Word(0.0, 0.9, "米がうまい"), Word(1.4, 2.4, "米がうまいと"), Word(2.4, 3.1, "満足度が高い")]
+        self.assertEqual([c.text for c in split_into_cues(words)],
+                         ["米がうまい", "米がうまいと満足度が高い"])
 
 
 if __name__ == "__main__":

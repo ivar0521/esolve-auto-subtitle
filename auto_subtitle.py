@@ -20,8 +20,10 @@ TRAILING_STRIP = "。、,."
 # 動画の 0 秒目に置く目印の字幕。Resolve は最初の字幕を置いた位置を起点にするため、
 # これが無いと話し始めまでの無音が詰められて字幕がずれる
 START_MARKER = "▼"
-# 聞き取ってほしい単語を書いておくファイル (ツールと同じフォルダ)
-WORD_LIST = Path(__file__).with_name("単語リスト.txt")
+# Whisper がまれに出力するゴミ文字 (単独で出てきたときだけ消す)
+NOISE_TOKENS = {"１", "1", "（", "）", "(", ")"}
+# 数字の直後に来たら「1個」「1回」のような本物の数字とみなす文字
+COUNTERS = set("個回日時分秒人本枚杯つ年月週円キログ番位")
 
 
 @dataclass
@@ -72,7 +74,8 @@ def boundary_score(left: str, right: str) -> int:
     if a in ("end", "comma"):
         return 4
     if a == "hira" and b in ("kanji", "kata", "alnum"):  # 「と|イチゴ」助詞の後
-        return 3
+        # 「イチゴの|プロテイン」の「の」はつながりが強いので少し下げる
+        return 2 if left.endswith("の") else 3
     if a == "hira" and b == "hira":  # 「ない|けど」
         return 1
     if a != b and {a, b} <= {"kanji", "kata", "alnum"}:  # 「ベリー|低脂肪」
@@ -83,9 +86,9 @@ def boundary_score(left: str, right: str) -> int:
 
 def split_into_cues(
     words: list[Word],
-    max_chars: int = 24,
+    max_chars: int = 14,
     max_duration: float = 7.0,
-    max_gap: float = 0.6,
+    max_gap: float = 0.35,
     strip_punctuation: bool = True,
 ) -> list[Cue]:
     """単語ごとのタイムスタンプを、読みやすい長さの字幕に分割する。
@@ -190,30 +193,51 @@ def add_start_marker(cues: list[Cue]) -> list[Cue]:
     return [Cue(0.0, min(1.0, cues[0].start), START_MARKER)] + cues
 
 
-def load_hotwords() -> str | None:
-    """単語リスト.txt に書かれた単語 (改行・読点区切り) を、聞き取りのヒントにする。"""
-    if not WORD_LIST.is_file():
-        return None
-    text = WORD_LIST.read_text(encoding="utf-8")
-    words = [w.strip() for w in text.replace("、", "\n").replace(",", "\n").splitlines()]
-    words = [w for w in words if w and not w.startswith("#")]
-    return "、".join(words) or None
+def clean_words(words: list[Word]) -> list[Word]:
+    """Whisper の出力のくせを直す。
+
+    - 単独の「１」「（」などのゴミ文字を消す
+    - 発話のまとまりの最後に、次の単語の頭 1 文字だけが紛れ込む
+      (例:「マルチビタミン オ|ートミール」) ので、次のまとまりへ移す
+    """
+    cleaned: list[Word] = []
+    for i, w in enumerate(words):
+        t = w.text.strip()
+        nxt = words[i + 1].text.strip() if i + 1 < len(words) else ""
+        if t in NOISE_TOKENS and not (t in "１1" and nxt[:1] in COUNTERS):
+            if w.segment_end and cleaned:
+                cleaned[-1].segment_end = True
+            continue
+        cleaned.append(w)
+
+    for i in range(len(cleaned) - 1):
+        w, nxt = cleaned[i], cleaned[i + 1]
+        if (
+            w.segment_end
+            and len(w.text.strip()) == 1
+            and i > 0
+            and boundary_score(w.text, nxt.text) == 0
+            and char_type(w.text.strip()) in ("hira", "kata")
+        ):
+            w.segment_end = False
+            w.start = w.end = nxt.start
+            cleaned[i - 1].segment_end = True
+    return cleaned
 
 
 def transcribe(path: Path, model, language: str | None, use_vad: bool = True) -> list[Word]:
-    hotwords = load_hotwords()
-    if hotwords:
-        print(f"  単語リスト: {hotwords}")
     segments, info = model.transcribe(
         str(path),
         language=language,
-        hotwords=hotwords,
         word_timestamps=True,
         # 無音部分を飛ばし、無音中の誤認識を防ぐ。ぼそっと話す声や BGM に重なった声を
         # 落とさないよう、声とみなす基準 (既定 0.5) を大きく下げ、前後の余白も広げている
         vad_filter=use_vad,
         vad_parameters={"threshold": 0.2, "speech_pad_ms": 600},
         condition_on_previous_text=False,  # 同じ文の繰り返し出力を防ぐ
+        # 「いただきます」のような短い一言を「声ではない」と判断して捨てないようにする
+        # (無音部分は上の vad_filter で除いているので、ここは甘くしてよい)
+        no_speech_threshold=0.9,
     )
     print(f"  言語: {info.language}  長さ: {info.duration:.0f}秒")
     words: list[Word] = []
@@ -223,7 +247,7 @@ def transcribe(path: Path, model, language: str | None, use_vad: bool = True) ->
         if seg_words:
             seg_words[-1].segment_end = True
         words.extend(seg_words)
-    return words
+    return clean_words(words)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -235,7 +259,7 @@ def main(argv: list[str] | None = None) -> int:
         help="音声認識モデル: small(速い) / medium / large-v3-turbo(既定・高精度)",
     )
     parser.add_argument("--language", default="ja", help="話している言語 (既定: ja)。auto で自動判定")
-    parser.add_argument("--max-chars", type=int, default=24, help="1つの字幕の最大文字数 (既定: 24)")
+    parser.add_argument("--max-chars", type=int, default=14, help="1つの字幕の最大文字数 (既定: 14)")
     parser.add_argument("--keep-punctuation", action="store_true", help="字幕末尾の「。」を残す")
     parser.add_argument(
         "--no-vad",
